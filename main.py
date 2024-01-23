@@ -10,6 +10,51 @@ from tqdm import tqdm
 
 import utils
 from model import Model
+import torch.nn  as nn
+import torch.nn.functional as F
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class ContrastiveLoss(nn.Module):
+   """
+   Vanilla Contrastive loss, also called InfoNceLoss as in SimCLR paper
+   """
+   def __init__(self, batch_size, temperature=0.5):
+       super().__init__()
+       self.batch_size = batch_size
+       self.temperature = temperature
+       self.mask = (~torch.eye(batch_size * 2, batch_size * 2, dtype=bool)).float().to(device)
+
+   def calc_similarity_batch(self, a, b):
+       representations = torch.cat([a, b], dim=0)
+       return F.cosine_similarity(representations.unsqueeze(1), representations.unsqueeze(0), dim=2)
+
+   def forward(self, proj_1, proj_2):
+       """
+       proj_1 and proj_2 are batched embeddings [batch, embedding_dim]
+       where corresponding indices are pairs
+       z_i, z_j in the SimCLR paper
+       """
+       batch_size = proj_1.shape[0]
+       z_i = F.normalize(proj_1, p=2, dim=1)
+       z_j = F.normalize(proj_2, p=2, dim=1)
+
+       similarity_matrix = self.calc_similarity_batch(z_i, z_j)
+
+       sim_ij = torch.diag(similarity_matrix, batch_size)
+       sim_ji = torch.diag(similarity_matrix, -batch_size)
+
+       positives = torch.cat([sim_ij, sim_ji], dim=0)
+
+       nominator = torch.exp(positives / self.temperature)
+
+       denominator = self.mask * torch.exp(similarity_matrix / self.temperature)
+
+       all_losses = -torch.log(nominator / torch.sum(denominator, dim=1))
+       loss = torch.sum(all_losses) / (2 * self.batch_size)
+       return loss
+
 
 
 # train for one epoch to learn unique features
@@ -20,19 +65,20 @@ def train(net, data_loader, train_optimizer):
         pos_1, pos_2 = pos_1.cuda(non_blocking=True), pos_2.cuda(non_blocking=True)
         feature_1, out_1 = net(pos_1)
         feature_2, out_2 = net(pos_2)
-        # [2*B, D]
-        out = torch.cat([out_1, out_2], dim=0)
-        # [2*B, 2*B]
-        sim_matrix = torch.exp(torch.mm(out, out.t().contiguous()) / temperature)
-        mask = (torch.ones_like(sim_matrix) - torch.eye(2 * batch_size, device=sim_matrix.device)).bool()
-        # [2*B, 2*B-1]
-        sim_matrix = sim_matrix.masked_select(mask).view(2 * batch_size, -1)
+        loss = sim_clr_loss(out_1, out_2)
+        # # [2*B, D]
+        # out = torch.cat([out_1, out_2], dim=0)
+        # # [2*B, 2*B]
+        # sim_matrix = torch.exp(torch.mm(out, out.t().contiguous()) / temperature)
+        # mask = (torch.ones_like(sim_matrix) - torch.eye(2 * batch_size, device=sim_matrix.device)).bool()
+        # # [2*B, 2*B-1]
+        # sim_matrix = sim_matrix.masked_select(mask).view(2 * batch_size, -1)
 
-        # compute loss
-        pos_sim = torch.exp(torch.sum(out_1 * out_2, dim=-1) / temperature)
-        # [2*B]
-        pos_sim = torch.cat([pos_sim, pos_sim], dim=0)
-        loss = (- torch.log(pos_sim / sim_matrix.sum(dim=-1))).mean()
+        # # compute loss
+        # pos_sim = torch.exp(torch.sum(out_1 * out_2, dim=-1) / temperature)
+        # # [2*B]
+        # pos_sim = torch.cat([pos_sim, pos_sim], dim=0)
+        # loss = (- torch.log(pos_sim / sim_matrix.sum(dim=-1))).mean()
         train_optimizer.zero_grad()
         loss.backward()
         train_optimizer.step()
@@ -100,6 +146,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     feature_dim, temperature, k = args.feature_dim, args.temperature, args.k
     batch_size, epochs = args.batch_size, args.epochs
+
+    sim_clr_loss = ContrastiveLoss(batch_size, temperature=0.1)
 
     # data prepare
     train_data = utils.CIFAR10Pair(root='data', train=True, transform=utils.train_transform, download=True)
